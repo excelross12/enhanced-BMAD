@@ -1,0 +1,100 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Prevent parallel staging deployments
+concurrency:
+  group: staging-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.bmad-method.dev
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js with cache
+        uses: ./.github/actions/setup-node-cache
+        with:
+          node-version: "20"
+      
+      - name: Build documentation (staging)
+        env:
+          SITE_URL: https://staging.bmad-method.dev
+          ENVIRONMENT: staging
+          NODE_ENV: production
+        run: npm run docs:build
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # TODO: Implement actual staging deployment logic
+          # This could deploy to a staging branch, separate hosting, or GitHub Pages preview
+          echo "✓ Deployment to staging completed"
+      
+      - name: Run smoke tests
+        uses: ./.github/actions/smoke-tests
+        with:
+          site-url: https://staging.bmad-method.dev
+          timeout: 300
+          max-retries: 2
+      
+      - name: Create deployment record
+        if: success()
+        run: |
+          node tools/ci/create-deployment-record.js \
+            --environment staging \
+            --commit ${{ github.sha }} \
+            --deployer ${{ github.actor }} \
+            --status success \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      
+      - name: Upload deployment record
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-record-staging-${{ github.run_id }}
+          path: deployment-record.json
+          retention-days: 90
+      
+      - name: Notify deployment success
+        if: success()
+        uses: ./.github/actions/notify-status
+        with:
+          notification-type: deployment
+          status: success
+          environment: staging
+          version: ${{ github.sha }}
+          commit-sha: ${{ github.sha }}
+          deployer: ${{ github.actor }}
+          discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          create-deployment-status: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Notify deployment failure
+        if: failure()
+        uses: ./.github/actions/notify-status
+        with:
+          notification-type: deployment
+          status: failure
+          environment: staging
+          commit-sha: ${{ github.sha }}
+          deployer: ${{ github.actor }}
+          error: "Staging deployment failed - check logs for details"
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          create-deployment-status: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

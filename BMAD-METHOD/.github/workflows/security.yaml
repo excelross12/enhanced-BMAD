@@ -1,0 +1,272 @@
+name: Security Scanning
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Run daily at 9 AM UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  secret-detection:
+    name: Secret Detection with TruffleHog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for comprehensive scanning
+
+      - name: Run TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # Scan the entire repository history
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --config=.trufflehog.yaml --fail --only-verified
+
+      - name: Comment on PR if secrets found
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ **Security Alert: Secrets Detected**\n\nTruffleHog has detected potential secrets in this pull request. Please review the workflow logs and remove any exposed credentials before merging.\n\n**Action Required:**\n1. Review the detected secrets in the workflow logs\n2. Remove the secrets from your code\n3. Rotate any exposed credentials\n4. Push the fixes to this branch\n\n**Note:** This PR cannot be merged until all secrets are removed.'
+            })
+
+      - name: Notify on secret detection
+        if: failure()
+        run: |
+          echo "::error::Secrets detected in the repository. Please review and remove them."
+          echo "::error::Check the TruffleHog scan results above for details."
+          exit 1
+
+  dependency-vulnerability-scan:
+    name: Dependency Vulnerability Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          # Run npm audit and capture output
+          npm audit --json > audit-results.json || true
+          
+          # Parse results for high/critical vulnerabilities
+          HIGH_CRITICAL=$(node -e "
+            const audit = require('./audit-results.json');
+            const vulnerabilities = audit.vulnerabilities || {};
+            let highCritical = [];
+            
+            for (const [name, data] of Object.entries(vulnerabilities)) {
+              if (data.severity === 'high' || data.severity === 'critical') {
+                highCritical.push({
+                  name: name,
+                  severity: data.severity,
+                  via: data.via,
+                  range: data.range,
+                  fixAvailable: data.fixAvailable
+                });
+              }
+            }
+            
+            console.log(JSON.stringify(highCritical));
+          ")
+          
+          echo "vulnerabilities=$HIGH_CRITICAL" >> $GITHUB_OUTPUT
+          
+          # Count high/critical vulnerabilities
+          COUNT=$(echo "$HIGH_CRITICAL" | node -e "
+            const data = require('fs').readFileSync(0, 'utf-8');
+            const vulns = JSON.parse(data);
+            console.log(vulns.length);
+          ")
+          
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          # Upload full audit results as artifact
+          echo "Audit complete. Found $COUNT high/critical vulnerabilities."
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-results
+          path: audit-results.json
+          retention-days: 30
+
+      - name: Create GitHub issue for vulnerabilities
+        if: steps.audit.outputs.count > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const auditData = JSON.parse(fs.readFileSync('audit-results.json', 'utf8'));
+            const vulnerabilities = auditData.vulnerabilities || {};
+            
+            let highCritical = [];
+            for (const [name, data] of Object.entries(vulnerabilities)) {
+              if (data.severity === 'high' || data.severity === 'critical') {
+                highCritical.push({
+                  name: name,
+                  severity: data.severity,
+                  via: Array.isArray(data.via) ? data.via.map(v => typeof v === 'string' ? v : v.title).join(', ') : data.via,
+                  range: data.range,
+                  fixAvailable: data.fixAvailable
+                });
+              }
+            }
+            
+            if (highCritical.length === 0) return;
+            
+            // Create issue body
+            let issueBody = `## 🚨 Security Alert: High/Critical Vulnerabilities Detected\n\n`;
+            issueBody += `**Scan Date:** ${new Date().toISOString()}\n`;
+            issueBody += `**Commit:** ${context.sha}\n`;
+            issueBody += `**Total High/Critical Vulnerabilities:** ${highCritical.length}\n\n`;
+            issueBody += `### Vulnerabilities\n\n`;
+            
+            for (const vuln of highCritical) {
+              issueBody += `#### ${vuln.name}\n`;
+              issueBody += `- **Severity:** ${vuln.severity.toUpperCase()}\n`;
+              issueBody += `- **Affected Range:** ${vuln.range}\n`;
+              issueBody += `- **Via:** ${vuln.via}\n`;
+              issueBody += `- **Fix Available:** ${vuln.fixAvailable ? 'Yes' : 'No'}\n\n`;
+            }
+            
+            issueBody += `### Action Required\n\n`;
+            issueBody += `1. Review the vulnerabilities listed above\n`;
+            issueBody += `2. Update affected dependencies to patched versions\n`;
+            issueBody += `3. Run \`npm audit fix\` to automatically fix vulnerabilities where possible\n`;
+            issueBody += `4. For vulnerabilities without automatic fixes, manually update dependencies\n`;
+            issueBody += `5. Verify all tests pass after updates\n\n`;
+            issueBody += `### Resources\n\n`;
+            issueBody += `- [npm audit documentation](https://docs.npmjs.com/cli/v10/commands/npm-audit)\n`;
+            issueBody += `- [Audit results artifact](${context.payload.repository.html_url}/actions/runs/${context.runId})\n`;
+            
+            // Check if similar issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security,dependencies,vulnerability'
+            });
+            
+            const similarIssue = existingIssues.data.find(issue => 
+              issue.title.includes('High/Critical Vulnerabilities Detected')
+            );
+            
+            if (similarIssue) {
+              // Update existing issue with new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: similarIssue.number,
+                body: `### Updated Scan Results\n\n${issueBody}`
+              });
+              
+              console.log(`Updated existing issue #${similarIssue.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚨 Security: High/Critical Vulnerabilities Detected (${highCritical.length} found)`,
+                body: issueBody,
+                labels: ['security', 'dependencies', 'vulnerability', 'high-priority']
+              });
+              
+              console.log(`Created issue #${issue.data.number}`);
+            }
+
+      - name: Comment on PR if vulnerabilities found
+        if: steps.audit.outputs.count > 0 && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const count = '${{ steps.audit.outputs.count }}';
+            
+            const body = `## ⚠️ Security Alert: Dependency Vulnerabilities Detected\n\n` +
+              `**High/Critical Vulnerabilities Found:** ${count}\n\n` +
+              `This pull request introduces or contains dependencies with high or critical security vulnerabilities.\n\n` +
+              `**Action Required:**\n` +
+              `1. Review the npm audit results in the workflow logs\n` +
+              `2. Run \`npm audit fix\` to automatically fix vulnerabilities\n` +
+              `3. Manually update dependencies that cannot be automatically fixed\n` +
+              `4. Verify all tests pass after updates\n\n` +
+              `**Note:** This PR cannot be merged until high/critical vulnerabilities are resolved.\n\n` +
+              `See the [workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId}) for detailed audit results.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail on high/critical vulnerabilities
+        if: steps.audit.outputs.count > 0
+        run: |
+          echo "::error::Found ${{ steps.audit.outputs.count }} high/critical vulnerabilities"
+          echo "::error::Review the audit results and update dependencies before merging"
+          exit 1
+
+  codeql-analysis:
+    name: CodeQL Static Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-extended
+          config-file: .github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+      - name: Comment on PR if issues found
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ **Security Alert: CodeQL Analysis Found Issues**\n\nCodeQL static analysis has detected potential security issues in this pull request. Please review the Security tab for detailed findings.\n\n**Action Required:**\n1. Review the CodeQL findings in the Security > Code scanning alerts tab\n2. Address the security issues identified\n3. Push the fixes to this branch\n4. Re-run the security scan\n\n**Note:** High-severity findings should be resolved before merging.'
+            })

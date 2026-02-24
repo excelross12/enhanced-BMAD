@@ -1,0 +1,76 @@
+name: "Setup Node.js with Cache"
+description: "Sets up Node.js with intelligent dependency caching and installation"
+author: "BMAD Method"
+
+inputs:
+  node-version:
+    description: "Node.js version to use"
+    required: true
+    default: "20"
+
+  working-directory:
+    description: "Working directory for the action"
+    required: false
+    default: "."
+
+outputs:
+  cache-hit:
+    description: "Whether the cache was hit (true/false)"
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+  cache-key:
+    description: "The cache key that was used"
+    value: ${{ steps.generate-key.outputs.cache-key }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Generate cache key
+      id: generate-key
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        export NODE_VERSION="${{ inputs.node-version }}"
+        export RUNNER_OS="${{ runner.os }}"
+        CACHE_KEY=$(node ${{ github.workspace }}/tools/ci/generate-cache-key.js)
+        echo "cache-key=$CACHE_KEY" >> $GITHUB_OUTPUT
+        echo "Generated cache key: $CACHE_KEY"
+
+    - name: Cache dependencies
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.npm
+          ${{ inputs.working-directory }}/node_modules
+        key: ${{ steps.generate-key.outputs.cache-key }}
+        restore-keys: |
+          ${{ runner.os }}-node-${{ inputs.node-version }}-
+
+    - name: Install dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Cache miss - installing dependencies..."
+        npm ci --prefer-offline --no-audit
+
+    - name: Cache hit notification
+      if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        echo "✓ Cache hit - dependencies restored from cache"
+
+    - name: Verify installation
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Verifying Node.js and npm installation..."
+        node --version
+        npm --version
+        echo "✓ Node.js environment ready"

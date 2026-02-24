@@ -1,0 +1,57 @@
+# TruffleHog Configuration for BMAD Method
+# This configuration defines custom secret patterns and scanning behavior
+
+# Custom detectors for BMAD-specific secrets
+detectors:
+  - name: BMAD API Key
+    keywords:
+      - bmad_
+      - bmad-api
+      - bmad_api_key
+    regex:
+      apikey: 'bmad_[a-zA-Z0-9]{32,64}'
+    verify:
+      - endpoint: ''
+        unsafe: false
+
+  - name: Discord Webhook
+    keywords:
+      - discord.com/api/webhooks
+      - discord_webhook
+    regex:
+      webhook: 'https://discord\.com/api/webhooks/[0-9]{17,19}/[a-zA-Z0-9_-]{68}'
+    verify:
+      - endpoint: ''
+        unsafe: false
+
+# Files and directories to exclude from scanning
+exclude:
+  paths:
+    - node_modules/
+    - .git/
+    - coverage/
+    - dist/
+    - build/
+    - '*.lock'
+    - '*.log'
+    - '.github/workflows/*.yaml'  # Exclude workflow files that may contain example patterns
+    - 'test/fixtures/**'  # Exclude test fixtures that may contain dummy secrets
+    - 'docs/**/*.md'  # Exclude documentation that may show example patterns
+    - '.trufflehog.yaml'  # Exclude this config file itself
+
+# Only report verified secrets (reduces false positives)
+only_verified: true
+
+# Fail the scan if any secrets are found
+fail: true
+
+# Enable JSON output for better parsing
+json: false
+
+# Scan depth (0 = all history, positive number = last N commits)
+# For PR scans, this is overridden by the workflow
+since_commit: ''
+
+# Additional configuration
+allow_verification_overlap: true
+filter_unverified: true

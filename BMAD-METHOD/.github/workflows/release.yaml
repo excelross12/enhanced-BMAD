@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Manual version override (e.g., 1.2.3). Leave empty for automatic semantic versioning.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js with cache
+        uses: ./.github/actions/setup-node-cache
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build artifacts
+        run: |
+          npm run build:docs || echo "No build:docs script found"
+          
+      - name: Run semantic-release
+        if: github.event.inputs.version == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npx semantic-release
+
+      - name: Create manual release
+        if: github.event.inputs.version != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          
+          # Validate version format
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in format X.Y.Z (e.g., 1.2.3)"
+            exit 1
+          fi
+          
+          # Update package.json
+          npm version "$VERSION" --no-git-tag-version
+          
+          # Create git tag
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore(release): $VERSION [skip ci]"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin main --tags
+          
+          # Create GitHub release
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes "Manual release v$VERSION" \
+            --latest
+
+      - name: Notify release status
+        if: always()
+        uses: ./.github/actions/notify-status
+        with:
+          status: ${{ job.status }}
+          context: 'Release'
+          description: 'Release workflow completed'
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}

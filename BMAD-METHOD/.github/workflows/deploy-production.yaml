@@ -1,0 +1,150 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: "Commit SHA to deploy (leave empty for latest main)"
+        required: false
+        type: string
+
+# Prevent parallel production deployments
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://bmad-method.dev
+    
+    steps:
+      - name: Determine commit to deploy
+        id: commit
+        run: |
+          if [ -n "${{ inputs.commit-sha }}" ]; then
+            echo "sha=${{ inputs.commit-sha }}" >> $GITHUB_OUTPUT
+            echo "Deploying specific commit: ${{ inputs.commit-sha }}"
+          else
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "Deploying latest commit: ${{ github.sha }}"
+          fi
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.commit.outputs.sha }}
+      
+      - name: Setup Node.js with cache
+        uses: ./.github/actions/setup-node-cache
+        with:
+          node-version: "20"
+      
+      - name: Build documentation (production)
+        env:
+          SITE_URL: https://bmad-method.dev
+          ENVIRONMENT: production
+          NODE_ENV: production
+        run: npm run docs:build
+      
+      - name: Create deployment artifact
+        run: |
+          echo "Creating deployment artifact..."
+          tar -czf deployment-artifact.tar.gz -C build/site .
+          echo "✓ Deployment artifact created"
+      
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-deployment-${{ github.run_id }}
+          path: deployment-artifact.tar.gz
+          retention-days: 90
+      
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/site
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      
+      - name: Wait for deployment propagation
+        run: |
+          echo "Waiting 30 seconds for deployment to propagate..."
+          sleep 30
+      
+      - name: Run production smoke tests
+        id: smoke-tests
+        uses: ./.github/actions/smoke-tests
+        with:
+          site-url: https://bmad-method.dev
+          timeout: 300
+          max-retries: 2
+      
+      - name: Create deployment record
+        if: success()
+        run: |
+          node tools/ci/create-deployment-record.js \
+            --environment production \
+            --commit ${{ steps.commit.outputs.sha }} \
+            --deployer ${{ github.actor }} \
+            --status success \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      
+      - name: Upload deployment record
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-record-production-${{ github.run_id }}
+          path: deployment-record.json
+          retention-days: 90
+      
+      - name: Notify deployment success
+        if: success()
+        uses: ./.github/actions/notify-status
+        with:
+          notification-type: deployment
+          status: success
+          environment: production
+          version: ${{ steps.commit.outputs.sha }}
+          commit-sha: ${{ steps.commit.outputs.sha }}
+          deployer: ${{ github.actor }}
+          discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          create-deployment-status: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Trigger rollback on smoke test failure
+        if: failure() && steps.smoke-tests.outcome == 'failure'
+        run: |
+          echo "❌ Smoke tests failed - automatic rollback required"
+          echo "Please trigger the rollback workflow manually with the previous stable version"
+          echo "Deployment SHA: ${{ steps.commit.outputs.sha }}"
+          exit 1
+      
+      - name: Notify deployment failure
+        if: failure()
+        uses: ./.github/actions/notify-status
+        with:
+          notification-type: deployment
+          status: failure
+          environment: production
+          commit-sha: ${{ steps.commit.outputs.sha }}
+          deployer: ${{ github.actor }}
+          error: "Production deployment failed - check logs for details. Rollback may be required."
+          url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          discord-webhook-url: ${{ secrets.DISCORD_WEBHOOK }}
+          create-deployment-status: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

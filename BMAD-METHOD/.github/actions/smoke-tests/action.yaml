@@ -1,0 +1,116 @@
+name: "Smoke Tests"
+description: "Execute smoke tests against a deployed site with retry logic and result reporting"
+author: "BMAD Method"
+
+inputs:
+  site-url:
+    description: "URL of the site to test"
+    required: true
+
+  timeout:
+    description: "Test timeout in seconds"
+    required: false
+    default: "300"
+
+  max-retries:
+    description: "Maximum number of retries for failed tests"
+    required: false
+    default: "2"
+
+outputs:
+  test-results:
+    description: "JSON test results"
+    value: ${{ steps.run-tests.outputs.results }}
+
+  passed:
+    description: "Whether all tests passed (true/false)"
+    value: ${{ steps.run-tests.outputs.passed }}
+
+  total-tests:
+    description: "Total number of tests executed"
+    value: ${{ steps.run-tests.outputs.total }}
+
+  passed-tests:
+    description: "Number of tests that passed"
+    value: ${{ steps.run-tests.outputs.passed-count }}
+
+  failed-tests:
+    description: "Number of tests that failed"
+    value: ${{ steps.run-tests.outputs.failed-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.site-url }}" ]; then
+          echo "Error: site-url is required"
+          exit 1
+        fi
+
+        # Validate URL format
+        if ! echo "${{ inputs.site-url }}" | grep -qE '^https?://'; then
+          echo "Error: site-url must start with http:// or https://"
+          exit 1
+        fi
+
+        echo "✓ Inputs validated"
+        echo "  Site URL: ${{ inputs.site-url }}"
+        echo "  Timeout: ${{ inputs.timeout }}s"
+        echo "  Max retries: ${{ inputs.max-retries }}"
+
+    - name: Run smoke tests
+      id: run-tests
+      shell: bash
+      env:
+        SITE_URL: ${{ inputs.site-url }}
+        TIMEOUT: ${{ inputs.timeout }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+      run: |
+        echo "Starting smoke tests..."
+
+        # Run the smoke tests script
+        node ${{ github.workspace }}/.github/actions/smoke-tests/smoke-tests.js
+
+        # The script will set outputs and exit with appropriate code
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: smoke-test-results-${{ github.run_id }}
+        path: /tmp/smoke-test-results.json
+        retention-days: 7
+
+    - name: Display test summary
+      if: always()
+      shell: bash
+      run: |
+        if [ -f /tmp/smoke-test-results.json ]; then
+          echo "## Smoke Test Results"
+          echo ""
+          
+          PASSED=$(jq -r '.summary.passed' /tmp/smoke-test-results.json)
+          FAILED=$(jq -r '.summary.failed' /tmp/smoke-test-results.json)
+          TOTAL=$(jq -r '.summary.total' /tmp/smoke-test-results.json)
+          
+          echo "Total: $TOTAL | Passed: $PASSED | Failed: $FAILED"
+          echo ""
+          
+          # Display failed tests if any
+          if [ "$FAILED" -gt 0 ]; then
+            echo "### Failed Tests:"
+            jq -r '.tests[] | select(.status == "failed") | "- \(.name): \(.error)"' /tmp/smoke-test-results.json
+          fi
+        else
+          echo "⚠ Test results file not found"
+        fi
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        # Keep the results file for artifact upload, but clean up other temp files
+        rm -f /tmp/smoke-test-*.log
+        echo "Cleaned up temporary files"

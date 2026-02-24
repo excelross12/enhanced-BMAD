@@ -1,0 +1,339 @@
+name: "Notify Status"
+description: "Send status notifications to Discord, create GitHub deployment status, and comment on PRs"
+author: "BMAD Method"
+
+inputs:
+  notification-type:
+    description: "Type of notification (deployment, security, release, ci-failure)"
+    required: true
+
+  status:
+    description: "Status of the event (success, failure, warning)"
+    required: false
+    default: "success"
+
+  environment:
+    description: "Target environment (staging, production)"
+    required: false
+
+  version:
+    description: "Version being deployed or released"
+    required: false
+
+  commit-sha:
+    description: "Commit SHA"
+    required: false
+    default: ${{ github.sha }}
+
+  deployer:
+    description: "User who triggered the deployment"
+    required: false
+    default: ${{ github.actor }}
+
+  duration:
+    description: "Duration in seconds"
+    required: false
+
+  error:
+    description: "Error message for failures"
+    required: false
+
+  workflow:
+    description: "Workflow name for CI failures"
+    required: false
+
+  branch:
+    description: "Branch name"
+    required: false
+    default: ${{ github.ref_name }}
+
+  url:
+    description: "URL to logs or release"
+    required: false
+
+  changelog:
+    description: "Changelog for releases"
+    required: false
+
+  title:
+    description: "Title for security alerts"
+    required: false
+
+  description:
+    description: "Description for security alerts"
+    required: false
+
+  severity:
+    description: "Severity for security alerts"
+    required: false
+
+  package:
+    description: "Package name for security alerts"
+    required: false
+
+  cve:
+    description: "CVE identifier for security alerts"
+    required: false
+
+  discord-webhook-url:
+    description: "Discord webhook URL (from secrets)"
+    required: false
+
+  github-token:
+    description: "GitHub token for creating deployment status and PR comments"
+    required: false
+    default: ${{ github.token }}
+
+  create-deployment-status:
+    description: "Whether to create GitHub deployment status (true/false)"
+    required: false
+    default: "false"
+
+  create-pr-comment:
+    description: "Whether to create PR comment (true/false)"
+    required: false
+    default: "false"
+
+outputs:
+  notification-sent:
+    description: "Whether notification was sent successfully (true/false)"
+    value: ${{ steps.send-notification.outputs.sent }}
+
+  deployment-status-created:
+    description: "Whether deployment status was created (true/false)"
+    value: ${{ steps.deployment-status.outputs.created }}
+
+  pr-comment-created:
+    description: "Whether PR comment was created (true/false)"
+    value: ${{ steps.pr-comment.outputs.created }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare notification data
+      id: prepare-data
+      shell: bash
+      run: |
+        # Build JSON data based on notification type
+        case "${{ inputs.notification-type }}" in
+          deployment)
+            DATA=$(cat <<EOF
+        {
+          "status": "${{ inputs.status }}",
+          "environment": "${{ inputs.environment }}",
+          "version": "${{ inputs.version }}",
+          "commit": "${{ inputs.commit-sha }}",
+          "deployer": "${{ inputs.deployer }}",
+          "duration": ${{ inputs.duration || 0 }},
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+            )
+            ;;
+          security)
+            DATA=$(cat <<EOF
+        {
+          "severity": "${{ inputs.severity }}",
+          "title": "${{ inputs.title }}",
+          "description": "${{ inputs.description }}",
+          "package": "${{ inputs.package }}",
+          "cve": "${{ inputs.cve }}"
+        }
+        EOF
+            )
+            ;;
+          release)
+            DATA=$(cat <<EOF
+        {
+          "version": "${{ inputs.version }}",
+          "changelog": "${{ inputs.changelog }}",
+          "url": "${{ inputs.url }}"
+        }
+        EOF
+            )
+            ;;
+          ci-failure)
+            DATA=$(cat <<EOF
+        {
+          "workflow": "${{ inputs.workflow }}",
+          "branch": "${{ inputs.branch }}",
+          "commit": "${{ inputs.commit-sha }}",
+          "error": "${{ inputs.error }}",
+          "url": "${{ inputs.url }}"
+        }
+        EOF
+            )
+            ;;
+          *)
+            echo "Error: Unknown notification type: ${{ inputs.notification-type }}"
+            exit 1
+            ;;
+        esac
+
+        # Save data to file for next step
+        echo "$DATA" > /tmp/notification-data.json
+        echo "Prepared notification data for type: ${{ inputs.notification-type }}"
+
+    - name: Format notification
+      id: format
+      shell: bash
+      run: |
+        # Format notification using the format-notification.js script
+        FORMATTED=$(node ${{ github.workspace }}/tools/ci/format-notification.js \
+          "${{ inputs.notification-type }}" \
+          "$(cat /tmp/notification-data.json)")
+
+        # Save formatted notification
+        echo "$FORMATTED" > /tmp/formatted-notification.json
+        echo "Formatted notification successfully"
+
+    - name: Send Discord notification
+      id: send-notification
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.discord-webhook-url }}" ]; then
+          echo "No Discord webhook URL provided - skipping Discord notification"
+          echo "sent=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Send notification to Discord
+        HTTP_CODE=$(curl -s -o /tmp/discord-response.txt -w "%{http_code}" \
+          -X POST "${{ inputs.discord-webhook-url }}" \
+          -H "Content-Type: application/json" \
+          -d @/tmp/formatted-notification.json)
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "✓ Discord notification sent successfully (HTTP $HTTP_CODE)"
+          echo "sent=true" >> $GITHUB_OUTPUT
+        else
+          echo "⚠ Failed to send Discord notification (HTTP $HTTP_CODE)"
+          cat /tmp/discord-response.txt
+          echo "sent=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create GitHub deployment status
+      id: deployment-status
+      if: inputs.create-deployment-status == 'true' && inputs.notification-type == 'deployment'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ -z "${{ inputs.environment }}" ]; then
+          echo "No environment specified - skipping deployment status"
+          echo "created=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Map status to GitHub deployment state
+        case "${{ inputs.status }}" in
+          success)
+            STATE="success"
+            ;;
+          failure)
+            STATE="failure"
+            ;;
+          warning)
+            STATE="error"
+            ;;
+          *)
+            STATE="pending"
+            ;;
+        esac
+
+        # Create deployment
+        DEPLOYMENT_ID=$(curl -s -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/deployments" \
+          -d "{
+            \"ref\": \"${{ inputs.commit-sha }}\",
+            \"environment\": \"${{ inputs.environment }}\",
+            \"auto_merge\": false,
+            \"required_contexts\": []
+          }" | jq -r '.id')
+
+        if [ "$DEPLOYMENT_ID" != "null" ] && [ -n "$DEPLOYMENT_ID" ]; then
+          echo "Created deployment: $DEPLOYMENT_ID"
+          
+          # Create deployment status
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses" \
+            -d "{
+              \"state\": \"$STATE\",
+              \"log_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+              \"description\": \"Deployment ${{ inputs.status }} for ${{ inputs.environment }}\",
+              \"environment\": \"${{ inputs.environment }}\"
+            }"
+          
+          echo "✓ GitHub deployment status created"
+          echo "created=true" >> $GITHUB_OUTPUT
+        else
+          echo "⚠ Failed to create deployment"
+          echo "created=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create PR comment
+      id: pr-comment
+      if: inputs.create-pr-comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        # Build comment based on notification type
+        case "${{ inputs.notification-type }}" in
+          deployment)
+            EMOJI="${{ inputs.status == 'success' && '🚀' || '❌' }}"
+            COMMENT="$EMOJI **Deployment ${{ inputs.status }}**
+
+        - **Environment:** ${{ inputs.environment }}
+        - **Version:** ${{ inputs.version }}
+        - **Commit:** \`${{ inputs.commit-sha }}\`
+        - **Duration:** ${{ inputs.duration }}s"
+            ;;
+          ci-failure)
+            COMMENT="❌ **CI Failure**
+
+        - **Workflow:** ${{ inputs.workflow }}
+        - **Branch:** ${{ inputs.branch }}
+        - **Error:** \`\`\`
+        ${{ inputs.error }}
+        \`\`\`
+
+        [View Logs](${{ inputs.url }})"
+            ;;
+          security)
+            COMMENT="🔒 **Security Alert**
+
+        - **Severity:** ${{ inputs.severity }}
+        - **Title:** ${{ inputs.title }}
+        - **Package:** ${{ inputs.package }}
+        - **CVE:** ${{ inputs.cve }}
+
+        ${{ inputs.description }}"
+            ;;
+          *)
+            echo "PR comments not supported for notification type: ${{ inputs.notification-type }}"
+            echo "created=false" >> $GITHUB_OUTPUT
+            exit 0
+            ;;
+        esac
+
+        # Post comment to PR
+        curl -s -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+          -d "{\"body\": $(echo "$COMMENT" | jq -Rs .)}"
+
+        echo "✓ PR comment created"
+        echo "created=true" >> $GITHUB_OUTPUT
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f /tmp/notification-data.json /tmp/formatted-notification.json /tmp/discord-response.txt
+        echo "Cleaned up temporary files"
